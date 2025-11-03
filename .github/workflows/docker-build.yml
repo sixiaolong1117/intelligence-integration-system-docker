@@ -1,0 +1,121 @@
+name: Build & Push to GHCR
+
+on:
+  push: 
+    branches: 
+        - master
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+  repository_dispatch:
+    types: [upstream_updated]
+
+jobs:
+  sync-and-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      # Step 1: 检出 main 分支（包含 Dockerfile）
+      - name: Checkout main branch (with Dockerfile)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Step 2: 复制 Dockerfile 到临时目录（防止被覆盖）
+      - name: Save Dockerfile
+        run: |
+          mkdir -p /tmp/build-context
+          cp Dockerfile /tmp/build-context/Dockerfile
+
+      # Step 3: 切换到 dev 分支并同步上游
+      - name: Checkout & Sync dev branch
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          token: ${{ secrets.GITHUB_TOKEN }}
+          submodules: recursive
+
+      - name: Sync Upstream dev
+        run: |
+          git remote add upstream https://github.com/SleepySoft/IntelligenceIntegrationSystem.git || true
+          git fetch upstream dev
+          git reset --hard upstream/dev
+          git submodule update --init --recursive
+          git push -f origin dev
+
+      # Step 4: 恢复 Dockerfile 到构建上下文
+      - name: Restore Dockerfile
+        run: |
+          cp /tmp/build-context/Dockerfile ./Dockerfile
+          ls -la Dockerfile  # 调试：确认文件存在
+
+      # Step 5: 获取 commit hash
+      - name: Get Commit Hash
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      # Step 6: 判断是否强制构建
+      - name: Detect Manual Trigger
+        id: trigger
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "force=true" >> $GITHUB_OUTPUT
+          else
+            echo "force=false" >> $GITHUB_OUTPUT
+          fi
+
+      # Step 7: 检查代码变更（仅 dev 内容）
+      - name: Check for Changes
+        id: changes
+        run: |
+          if [ -z "$(git status --porcelain | grep -v '^?? Dockerfile')" ]; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      # Step 8: 决定是否构建
+      - name: Decide Build
+        id: build
+        run: |
+          if [[ "${{ steps.trigger.outputs.force }}" == "true" ]] || \
+             [[ "${{ steps.changes.outputs.changed }}" == "true" ]]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          fi
+
+      # Step 9~12: 构建并推送到 GHCR
+      - name: Set up QEMU
+        if: steps.build.outputs.should_build == 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: steps.build.outputs.should_build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        if: steps.build.outputs.should_build == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push
+        if: steps.build.outputs.should_build == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:sha-${{ steps.commit.outputs.sha }}
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:latest
+          cache-to: type=inline
